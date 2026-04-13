@@ -845,6 +845,10 @@ function updateProjectBranchSortIcons() {
 
 function sortProjectBranch(rows) {
   return [...rows].sort((a, b) => {
+    const pa = (a.project || '').toLowerCase();
+    const pb = (b.project || '').toLowerCase();
+    if (pa < pb) return -1;
+    if (pa > pb) return 1;
     const av = a[branchSortCol] ?? 0;
     const bv = b[branchSortCol] ?? 0;
     if (av < bv) return branchSortDir === 'desc' ? 1 : -1;
