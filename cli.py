@@ -260,6 +260,106 @@ def cmd_stats():
     conn.close()
 
 
+def cmd_analyze():
+    import subprocess
+    import shutil
+
+    if not shutil.which("claude"):
+        print("Error: 'claude' CLI not found in PATH.")
+        print("Install Claude Code: https://claude.com/claude-code")
+        sys.exit(1)
+
+    conn = require_db()
+    conn.row_factory = sqlite3.Row
+
+    from analyzer import build_snapshot, scrub, estimate_waste, build_prompt
+    from scanner import init_db
+    init_db(conn)
+
+    print("Building usage snapshot...")
+    snapshot = build_snapshot(conn)
+    waste    = estimate_waste(snapshot)
+    scrubbed = scrub(snapshot)
+
+    cache_pct = scrubbed["cache_hit_rate"] * 100
+    print(f"\n  Cache hit rate : {cache_pct:.1f}%")
+    print(f"  Cost (30d)     : ${scrubbed['total_cost_30d']:.2f}")
+    if waste["cache_savings"] > 0:
+        print(f"  Est. waste     : ${waste['cache_savings']:.2f}/mo (vs 80% cache target)")
+    print()
+    print("This will run your local `claude` CLI:")
+    print("  - Uses your existing Claude auth + plan")
+    print("  - Tokens count toward your own usage (~$0.05–0.20 per analysis)")
+    print()
+    ans = input("Run analysis? [y/N] ").strip().lower()
+    if ans != "y":
+        print("Cancelled.")
+        return
+
+    prompt = build_prompt(snapshot)
+    print("\nRunning analysis (streaming)...\n")
+    hr()
+
+    suggestions = ""
+    try:
+        proc = subprocess.Popen(
+            ["claude", "--print", "--output-format", "stream-json",
+             "--include-partial-messages"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+
+        import json as _json
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = _json.loads(line)
+            except Exception:
+                continue
+            text = _extract_text_delta(ev)
+            if text:
+                print(text, end="", flush=True)
+                suggestions += text
+
+        proc.wait()
+        print()
+        hr()
+
+        if suggestions:
+            conn.execute(
+                "INSERT INTO analyses(timestamp,snapshot_json,suggestions_md,cache_rate,est_monthly_waste) "
+                "VALUES (?,?,?,?,?)",
+                (datetime.now().isoformat(), _json.dumps(scrubbed),
+                 suggestions, scrubbed["cache_hit_rate"], waste["cache_savings"])
+            )
+            conn.commit()
+            print("\nAnalysis saved to database.")
+
+    except KeyboardInterrupt:
+        print("\nAborted.")
+    except FileNotFoundError:
+        print("Error: 'claude' not found. Install: https://claude.com/claude-code")
+
+
+def _extract_text_delta(event):
+    """Extract text content from a claude --output-format stream-json event."""
+    t = event.get("type", "")
+    if "content_block_delta" in t or t == "content_block_delta":
+        delta = event.get("delta", {})
+        return delta.get("text") or ""
+    inner = event.get("event") or {}
+    if isinstance(inner, dict) and "content_block_delta" in inner.get("type", ""):
+        return (inner.get("delta") or {}).get("text", "")
+    se = event.get("stream_event") or {}
+    if isinstance(se, dict) and "content_block_delta" in se.get("type", ""):
+        return (se.get("delta") or {}).get("text", "")
+    return None
+
+
 def cmd_dashboard(projects_dir=None):
     import webbrowser
     import threading
@@ -293,13 +393,15 @@ Usage:
   python cli.py today                        Show today's usage summary
   python cli.py stats                        Show all-time statistics
   python cli.py dashboard [--projects-dir PATH]  Scan + start dashboard
+  python cli.py analyze                      Analyze usage and get AI suggestions
 """
 
 COMMANDS = {
-    "scan": cmd_scan,
-    "today": cmd_today,
-    "stats": cmd_stats,
+    "scan":      cmd_scan,
+    "today":     cmd_today,
+    "stats":     cmd_stats,
     "dashboard": cmd_dashboard,
+    "analyze":   cmd_analyze,
 }
 
 def parse_projects_dir(args):
