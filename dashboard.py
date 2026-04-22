@@ -51,58 +51,163 @@ def _calc_cost(model, inp, out, cr, cc):
     )
 
 
-def get_active_session(db_path=DB_PATH):
-    """Return live stats for the most recent session."""
-    if not db_path.exists():
-        return None
+def _find_active_jsonl():
+    """Return (path, mtime) of most recently modified JSONL file, or (None, None)."""
+    import glob as _glob
+    from scanner import PROJECTS_DIR, XCODE_PROJECTS_DIR
+    candidates = []
+    for d in [PROJECTS_DIR, XCODE_PROJECTS_DIR]:
+        if Path(d).exists():
+            candidates.extend(_glob.glob(str(Path(d) / "**" / "*.jsonl"), recursive=True))
+    if not candidates:
+        return None, None
+    best = max(candidates, key=os.path.getmtime)
+    return best, os.path.getmtime(best)
+
+
+def _read_jsonl_head_tail(filepath, head_lines=30, tail_lines=400):
+    """Return (cwd, context_tokens, session_id, last_timestamp) from a JSONL file.
+
+    head_lines: scan first N lines to find session_id + cwd (cwd may be absent early on).
+    tail_lines: scan last N lines for context fill + last timestamp.
+
+    context_tokens = input_tokens + cache_read + cache_creation on the last assistant
+    turn that has non-zero total usage — this is the true context window fill.
+    """
+    from collections import deque
+    head = []
+    tail = deque(maxlen=tail_lines)
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        sess = conn.execute("""
-            SELECT session_id, project_name, first_timestamp, last_timestamp, model,
-                   total_input_tokens, total_output_tokens,
-                   total_cache_read, total_cache_creation, turn_count
-            FROM sessions ORDER BY last_timestamp DESC LIMIT 1
-        """).fetchone()
-        if not sess:
-            conn.close()
-            return None
-        last_turn = conn.execute("""
-            SELECT input_tokens FROM turns
-            WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1
-        """, (sess["session_id"],)).fetchone()
-        conn.close()
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if i < head_lines:
+                    head.append(stripped)
+                tail.append(stripped)
     except Exception:
+        return None, 0, None, None
+
+    # session_id + cwd: scan head for first record with each
+    session_id = None
+    cwd = ""
+    for raw in head:
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if session_id is None:
+            session_id = rec.get("sessionId")
+        if not cwd:
+            cwd = rec.get("cwd", "")
+        if session_id and cwd:
+            break
+
+    # last_timestamp + context fill: walk tail backwards
+    last_timestamp = None
+    context_tokens = 0
+
+    for raw in reversed(tail):
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        ts = rec.get("timestamp", "")
+        if ts and last_timestamp is None:
+            last_timestamp = ts
+        if context_tokens == 0 and rec.get("type") == "assistant":
+            usage = rec.get("message", {}).get("usage", {})
+            inp  = usage.get("input_tokens", 0) or 0
+            cr   = usage.get("cache_read_input_tokens", 0) or 0
+            cc   = usage.get("cache_creation_input_tokens", 0) or 0
+            total = inp + cr + cc
+            if total > 0:
+                context_tokens = total
+        if last_timestamp and context_tokens:
+            break
+
+    return cwd, context_tokens, session_id, last_timestamp
+
+
+def get_active_session(db_path=DB_PATH):
+    """Return live stats for the most recently active session.
+
+    Uses JSONL file mtime (not DB timestamp) to find the true active session,
+    and tail-reads the file for current context fill — avoids stale DB data.
+    """
+    jsonl_path, mtime = _find_active_jsonl()
+    if jsonl_path is None:
         return None
 
-    context_tokens = last_turn["input_tokens"] if last_turn else 0
+    cwd, context_tokens, session_id, last_ts = _read_jsonl_head_tail(jsonl_path)
+    if not session_id:
+        return None
+
+    from scanner import project_name_from_cwd
+    project = project_name_from_cwd(cwd)
     context_pct = round(context_tokens / MODEL_CONTEXT_LIMIT * 100, 1)
 
-    try:
-        t1 = datetime.fromisoformat(sess["first_timestamp"].replace("Z", "+00:00"))
-        t2 = datetime.fromisoformat(sess["last_timestamp"].replace("Z", "+00:00"))
-        duration_min = round((t2 - t1).total_seconds() / 60, 1)
-        start_str = t1.strftime("%H:%M")
-    except Exception:
-        duration_min = 0.0
-        start_str = "—"
+    # Staleness: use last record's ISO timestamp (reliable, not file mtime)
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            now_utc = datetime.now(last_dt.tzinfo) if last_dt.tzinfo else datetime.now()
+            last_seen_mins = round((now_utc - last_dt).total_seconds() / 60, 1)
+        except Exception:
+            last_seen_mins = 0.0
+    else:
+        last_seen_mins = round((time.time() - mtime) / 60, 1)
+    last_seen_mins = max(0.0, last_seen_mins)
+    is_stale = last_seen_mins > 30
+
+    # Pull accumulated stats from DB (may lag by one scan cycle, acceptable)
+    cost = 0.0
+    turn_count = 0
+    duration_min = 0.0
+    start_str = "—"
+    model = "unknown"
+
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            sess = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if sess:
+                cost = round(_calc_cost(
+                    sess["model"],
+                    sess["total_input_tokens"]   or 0,
+                    sess["total_output_tokens"]  or 0,
+                    sess["total_cache_read"]     or 0,
+                    sess["total_cache_creation"] or 0,
+                ), 4)
+                turn_count = sess["turn_count"] or 0
+                model = sess["model"] or "unknown"
+                try:
+                    t1 = datetime.fromisoformat(sess["first_timestamp"].replace("Z", "+00:00"))
+                    t2 = datetime.fromisoformat(sess["last_timestamp"].replace("Z", "+00:00"))
+                    duration_min = round((t2 - t1).total_seconds() / 60, 1)
+                    start_str = t1.strftime("%H:%M")
+                except Exception:
+                    pass
+            conn.close()
+        except Exception:
+            pass
 
     return {
-        "session_id":     sess["session_id"][:8],
-        "project":        sess["project_name"] or "unknown",
-        "model":          sess["model"] or "unknown",
-        "turns":          sess["turn_count"] or 0,
-        "cost":           round(_calc_cost(
-            sess["model"],
-            sess["total_input_tokens"]   or 0,
-            sess["total_output_tokens"]  or 0,
-            sess["total_cache_read"]     or 0,
-            sess["total_cache_creation"] or 0,
-        ), 4),
-        "duration_min":   duration_min,
-        "context_tokens": context_tokens,
-        "context_pct":    context_pct,
-        "start_str":      start_str,
+        "session_id":      session_id[:8],
+        "project":         project,
+        "model":           model,
+        "turns":           turn_count,
+        "cost":            cost,
+        "duration_min":    duration_min,
+        "context_tokens":  context_tokens,
+        "context_pct":     context_pct,
+        "start_str":       start_str,
+        "last_seen_mins":  last_seen_mins,
+        "is_stale":        is_stale,
     }
 
 
@@ -469,7 +574,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="gauge-card" id="session-card">
-      <div class="gauge-title">Active Session</div>
+      <div class="gauge-title" id="session-card-title">Active Session</div>
       <div class="gauge-row">
         <div class="gauge-wrap">
           <svg id="ctx-gauge" viewBox="0 0 110 70" width="110" height="70">
@@ -1204,7 +1309,20 @@ async function loadLive() {
     }
     if (activeResp.ok) {
       const a = await activeResp.json();
+      const titleEl = document.getElementById('session-card-title');
+      const card    = document.getElementById('session-card');
       if (a && !a.error) {
+        const stale = a.is_stale;
+        const seenMins = a.last_seen_mins || 0;
+        const seenLabel = seenMins < 1 ? 'just now'
+          : seenMins < 60 ? Math.round(seenMins) + 'min ago'
+          : (seenMins / 60).toFixed(1) + 'h ago';
+
+        titleEl.textContent = stale
+          ? `Last Session (${seenLabel})`
+          : `Active Session · ${seenLabel}`;
+        card.style.opacity = stale ? '0.55' : '1';
+
         setGauge('ctx-arc', 'ctx-pct-text', a.context_pct);
         document.getElementById('ctx-pct').textContent = a.context_pct.toFixed(1) + '% ctx';
         document.getElementById('ctx-detail').innerHTML =
@@ -1212,6 +1330,8 @@ async function loadLive() {
           `Turns: ${statusSpan(a.turns, 40, 45)} &middot; Cost: $${a.cost.toFixed(2)}<br>` +
           `Duration: ${a.duration_min}min &middot; Start: ${esc(a.start_str)}`;
       } else {
+        titleEl.textContent = 'Active Session';
+        card.style.opacity = '0.55';
         document.getElementById('ctx-pct').textContent = 'No session';
         document.getElementById('ctx-detail').textContent = 'No active session found.';
         setGauge('ctx-arc', 'ctx-pct-text', 0);
@@ -1493,15 +1613,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def _monitor_loop():
-    """Background thread: check active session every 15s, fire OS notifications."""
+    """Background thread: scan DB + check active session every 15s, fire OS notifications."""
     while True:
         try:
+            # Keep DB fresh so active session stats are accurate
+            from scanner import scan
+            scan(verbose=False)
+
             from alert_config import load_config
             from notifier import send_notification
             cfg = load_config()
             if cfg.get("os_notifications"):
                 sess = get_active_session()
-                if sess:
+                if sess and not sess.get("is_stale"):
                     from session_alert_hook import check_thresholds
                     alerts = check_thresholds(sess, cfg)
                     if alerts:
