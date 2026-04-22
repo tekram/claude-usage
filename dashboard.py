@@ -5,7 +5,9 @@ dashboard.py - Local web dashboard served on localhost:8080.
 import json
 import os
 import sqlite3
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 
@@ -145,9 +147,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
   header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
   header .meta { color: var(--muted); font-size: 12px; }
-  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
+  header .header-btns { display: flex; gap: 8px; align-items: center; }
+  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #analyze-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  #analyze-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  #analyze-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #analyze-btn.ready { border-color: var(--accent); color: var(--accent); }
+
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex; }
+  .modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 28px; max-width: 500px; width: 90%; }
+  .modal-box h3 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
+  .modal-box p { font-size: 13px; color: var(--muted); margin-bottom: 10px; line-height: 1.5; }
+  .modal-box ul { font-size: 13px; color: var(--muted); padding-left: 18px; margin-bottom: 14px; line-height: 1.8; }
+  .modal-box pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 11px; color: var(--muted); max-height: 160px; overflow-y: auto; white-space: pre-wrap; margin-bottom: 14px; }
+  .modal-btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+  .modal-btns .btn-primary { background: var(--accent); color: white; border: none; padding: 7px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .modal-btns .btn-secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .modal-btns .btn-secondary:hover { color: var(--text); }
+  .modal-btns label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 5px; cursor: pointer; flex-grow: 1; }
+
+  #analyzer-panel { display: none; position: fixed; top: 0; right: 0; height: 100vh; width: 440px; background: var(--card); border-left: 1px solid var(--border); z-index: 90; flex-direction: column; box-shadow: -4px 0 24px rgba(0,0,0,0.5); }
+  #analyzer-panel.open { display: flex; }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .panel-header h3 { font-size: 14px; font-weight: 600; color: var(--text); }
+  .panel-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0 4px; line-height: 1; }
+  .panel-close:hover { color: var(--text); }
+  .panel-status { padding: 10px 20px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); flex-shrink: 0; min-height: 36px; }
+  .panel-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .panel-body .suggestions { font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+  .panel-footer { padding: 12px 20px; border-top: 1px solid var(--border); flex-shrink: 0; display: flex; gap: 8px; }
+  #deep-dive-btn { flex: 1; background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  #deep-dive-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  #deep-dive-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #rerun-btn { background: var(--accent); color: white; border: none; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  #rerun-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
@@ -224,8 +260,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <header>
   <h1>Claude Code Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  <div class="header-btns">
+    <button id="analyze-btn" onclick="analyzeClick()" disabled title="Checking for claude CLI...">&#x2728; Analyze Usage</button>
+    <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  </div>
 </header>
+
+<!-- Analyzer disclosure modal -->
+<div class="modal-overlay" id="analyzer-modal">
+  <div class="modal-box">
+    <h3>&#x2728; Analyze Usage</h3>
+    <p>This runs your local <code>claude</code> CLI:</p>
+    <ul>
+      <li>Uses your existing Claude auth &amp; plan</li>
+      <li>Tokens count toward your own usage</li>
+      <li>Estimated cost: ~$0.05&ndash;0.20 per analysis</li>
+    </ul>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:6px">Data sent (scrubbed snapshot &mdash; project paths hashed):</p>
+    <pre id="modal-snapshot-preview">Loading...</pre>
+    <div class="modal-btns">
+      <label><input type="checkbox" id="modal-dont-show"> Don&rsquo;t show again</label>
+      <button class="btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" onclick="runAnalysis()">Run Analysis</button>
+    </div>
+  </div>
+</div>
+
+<!-- Analyzer results panel -->
+<div id="analyzer-panel">
+  <div class="panel-header">
+    <h3>&#x2728; Usage Analysis</h3>
+    <button class="panel-close" onclick="closePanel()">&#x2715;</button>
+  </div>
+  <div class="panel-status" id="panel-status">Ready.</div>
+  <div class="panel-body"><div class="suggestions" id="panel-suggestions"></div></div>
+  <div class="panel-footer">
+    <button id="deep-dive-btn" onclick="launchDeepDive()" disabled>&#x1F50D; Open Deep Dive</button>
+    <button id="rerun-btn" onclick="analyzeClick()">&#x21bb; Re-run</button>
+  </div>
+</div>
 
 <div id="filter-bar">
   <div class="filter-label">Models</div>
@@ -1231,10 +1304,319 @@ function scheduleAutoRefresh() {
 
 loadData();
 scheduleAutoRefresh();
+
+// ── Analyzer ──────────────────────────────────────────────────────────────
+let analyzerReady = false;
+let activeSSE = null;
+
+async function initAnalyzer() {
+  try {
+    const r = await fetch('/api/analyzer/preflight');
+    const d = await r.json();
+    analyzerReady = d.cli_available;
+    const btn = document.getElementById('analyze-btn');
+    if (analyzerReady) {
+      btn.disabled = false;
+      btn.classList.add('ready');
+      btn.title = 'Analyze usage with your local claude CLI (' + (d.version || 'found') + ')';
+    } else {
+      btn.title = 'Requires Claude Code CLI. Install: https://claude.com/claude-code';
+    }
+  } catch(e) { /* non-fatal */ }
+}
+
+async function analyzeClick() {
+  if (!analyzerReady) return;
+  if (localStorage.getItem('analyzer_skip_modal') === '1') { runAnalysis(); return; }
+  try {
+    const r = await fetch('/api/analyzer/snapshot');
+    const d = await r.json();
+    const snap = d.snapshot || {};
+    const lines = [
+      'Cache hit rate: ' + ((snap.cache_hit_rate*100)||0).toFixed(1) + '%',
+      'Cost (30d): $' + ((snap.total_cost_30d)||0).toFixed(2),
+      'Sessions: ' + ((snap.session_patterns||{}).count||0),
+      'Models: ' + (snap.model_distribution||[]).map(function(m){return m.model;}).join(', '),
+      'Top tools: ' + (snap.top_tools||[]).slice(0,5).map(function(t){return t.tool;}).join(', '),
+    ];
+    document.getElementById('modal-snapshot-preview').textContent = lines.join('\n');
+  } catch(e) {
+    document.getElementById('modal-snapshot-preview').textContent = '(preview unavailable)';
+  }
+  document.getElementById('analyzer-modal').classList.add('open');
+}
+
+function closeModal() { document.getElementById('analyzer-modal').classList.remove('open'); }
+
+function runAnalysis() {
+  var cb = document.getElementById('modal-dont-show');
+  if (cb && cb.checked) localStorage.setItem('analyzer_skip_modal', '1');
+  closeModal();
+  openPanel();
+  startSSE();
+}
+
+function openPanel() {
+  document.getElementById('analyzer-panel').classList.add('open');
+  document.getElementById('panel-suggestions').textContent = '';
+  document.getElementById('deep-dive-btn').disabled = true;
+  setStatus('Starting analysis...');
+}
+
+function closePanel() {
+  document.getElementById('analyzer-panel').classList.remove('open');
+  if (activeSSE) { activeSSE.close(); activeSSE = null; }
+}
+
+function setStatus(msg) { document.getElementById('panel-status').textContent = msg; }
+
+function startSSE() {
+  if (activeSSE) activeSSE.close();
+  document.getElementById('rerun-btn').disabled = true;
+  var sugEl = document.getElementById('panel-suggestions');
+  sugEl.textContent = '';
+  var es = new EventSource('/api/analyzer/stream');
+  activeSSE = es;
+  es.onmessage = function(e) {
+    try {
+      var d = JSON.parse(e.data);
+      if (d.type === 'chunk') {
+        sugEl.textContent += d.text;
+      } else if (d.type === 'done') {
+        var inp = d.input_tokens || 0, out = d.output_tokens || 0;
+        var est = ((inp * 3 + out * 15) / 1000000).toFixed(4);
+        setStatus('Done · ' + inp.toLocaleString() + ' in / ' + out.toLocaleString() + ' out · est $' + est);
+        document.getElementById('deep-dive-btn').disabled = false;
+        document.getElementById('rerun-btn').disabled = false;
+        es.close(); activeSSE = null;
+      } else if (d.type === 'error') {
+        setStatus('Error: ' + d.message);
+        document.getElementById('rerun-btn').disabled = false;
+        es.close(); activeSSE = null;
+      }
+    } catch(ex) {}
+  };
+  es.onerror = function() {
+    var has = sugEl.textContent.length > 0;
+    setStatus(has ? 'Stream closed.' : 'Connection error.');
+    document.getElementById('rerun-btn').disabled = false;
+    if (has) document.getElementById('deep-dive-btn').disabled = false;
+    es.close(); activeSSE = null;
+  };
+  setStatus('Running: claude --print --output-format stream-json ...');
+}
+
+async function launchDeepDive() {
+  var btn = document.getElementById('deep-dive-btn');
+  btn.disabled = true; btn.textContent = 'Launching...';
+  try {
+    var r = await fetch('/api/analyzer/launch-deep-dive', {method: 'POST'});
+    var d = await r.json();
+    setStatus(d.ok ? 'Deep dive launched in terminal.' : 'Launch failed: ' + d.detail);
+  } catch(e) {
+    setStatus('Launch error: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '🔍 Open Deep Dive';
+  }
+}
+
+initAnalyzer();
 </script>
 </body>
 </html>
 """
+
+
+# ── Analyzer state ────────────────────────────────────────────────────────────
+
+_preflight_cache = None
+_snapshot_cache  = None
+_analyzer_lock   = threading.Lock()
+_SNAPSHOT_TTL    = 600  # seconds
+
+
+def _run_preflight():
+    """Run `claude --version` and cache result. Returns (available, version_str)."""
+    global _preflight_cache
+    import subprocess, shutil
+    if not shutil.which("claude"):
+        _preflight_cache = (False, None)
+        return False, None
+    try:
+        r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+        ver = r.stdout.strip() or r.stderr.strip() or "unknown"
+        _preflight_cache = (True, ver)
+        return True, ver
+    except Exception:
+        _preflight_cache = (False, None)
+        return False, None
+
+
+def _get_analyzer_snapshot():
+    """Return cached snapshot or rebuild (10-min TTL)."""
+    global _snapshot_cache
+    now = time.time()
+    if _snapshot_cache and (now - _snapshot_cache[1]) < _SNAPSHOT_TTL:
+        return _snapshot_cache[0]
+    if not DB_PATH.exists():
+        return None
+    try:
+        from scanner import get_db, init_db
+        from analyzer import build_snapshot
+        conn = get_db(DB_PATH)
+        init_db(conn)
+        snap = build_snapshot(conn)
+        conn.close()
+        _snapshot_cache = (snap, now)
+        return snap
+    except Exception:
+        return None
+
+
+def _extract_text_delta(event):
+    """Extract text from a claude stream-json event."""
+    t = event.get("type", "")
+    if "content_block_delta" in t:
+        delta = event.get("delta", {})
+        return delta.get("text") or ""
+    inner = event.get("event") or {}
+    if isinstance(inner, dict) and "content_block_delta" in inner.get("type", ""):
+        return (inner.get("delta") or {}).get("text", "")
+    se = event.get("stream_event") or {}
+    if isinstance(se, dict) and "content_block_delta" in se.get("type", ""):
+        return (se.get("delta") or {}).get("text", "")
+    return None
+
+
+def _stream_analyzer(snapshot, wfile):
+    """Run claude --print streaming, forward text deltas as SSE events."""
+    import subprocess
+    from analyzer import build_prompt, scrub, estimate_waste
+
+    prompt = build_prompt(snapshot)
+
+    def sse(data):
+        line = f"data: {json.dumps(data)}\n\n"
+        try:
+            wfile.write(line.encode("utf-8"))
+            wfile.flush()
+        except Exception:
+            pass
+
+    try:
+        proc = subprocess.Popen(
+            ["claude", "--print", "--output-format", "stream-json",
+             "--include-partial-messages"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+
+        suggestions = ""
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            text = _extract_text_delta(ev)
+            if text:
+                suggestions += text
+                sse({"type": "chunk", "text": text})
+            t = ev.get("type", "")
+            if "result" in t and ev.get("duration_ms"):
+                usage = ev.get("usage") or {}
+                sse({"type": "done",
+                     "input_tokens":  usage.get("input_tokens", 0),
+                     "output_tokens": usage.get("output_tokens", 0),
+                     "duration_ms":   ev.get("duration_ms", 0)})
+
+        proc.wait(timeout=5)
+
+        if suggestions and DB_PATH.exists():
+            try:
+                from scanner import get_db, init_db
+                conn = get_db(DB_PATH)
+                init_db(conn)
+                waste = estimate_waste(snapshot)
+                conn.execute(
+                    "INSERT INTO analyses(timestamp,snapshot_json,suggestions_md,cache_rate,est_monthly_waste) "
+                    "VALUES (?,?,?,?,?)",
+                    (datetime.now().isoformat(), json.dumps(scrub(snapshot)),
+                     suggestions, snapshot["cache_hit_rate"], waste["cache_savings"])
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+        sse({"type": "done", "input_tokens": 0, "output_tokens": 0, "duration_ms": 0})
+
+    except FileNotFoundError:
+        sse({"type": "error", "message": "claude CLI not found"})
+    except Exception as e:
+        sse({"type": "error", "message": str(e)})
+
+
+def _launch_deep_dive(snapshot):
+    """Write launch script and spawn terminal. Returns (ok, detail_str)."""
+    import sys as _sys
+    import subprocess
+    from analyzer import build_prompt
+
+    tmp_dir = Path.home() / ".claude" / "analyzer-tmp"
+    tmp_dir.mkdir(exist_ok=True)
+
+    ts       = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ctx_file = tmp_dir / f"analyzer-context-{ts}.md"
+    ctx_file.write_text(build_prompt(snapshot), encoding="utf-8")
+
+    platform = _sys.platform
+    try:
+        if platform == "win32":
+            bat = tmp_dir / f"launch-{ts}.bat"
+            bat.write_text(
+                f'@echo off\r\n'
+                f'echo === Claude Usage Analyzer - Deep Dive ===\r\n'
+                f'echo Session uses your claude CLI + auth.\r\n'
+                f'echo Tokens billed to your plan.\r\n'
+                f'echo.\r\n'
+                f'type "{ctx_file}" | claude\r\n'
+                f'del "{ctx_file}"\r\n'
+                f'pause\r\n',
+                encoding="utf-8"
+            )
+            os.startfile(str(bat))
+            return True, str(bat)
+        elif platform == "darwin":
+            sh = tmp_dir / f"launch-{ts}.command"
+            sh.write_text(
+                f'#!/bin/bash\necho "=== Claude Usage Analyzer - Deep Dive ==="\n'
+                f'cat "{ctx_file}" | claude\nrm -f "{ctx_file}" "$0"\n',
+                encoding="utf-8"
+            )
+            sh.chmod(0o755)
+            subprocess.Popen(["open", "-a", "Terminal", str(sh)])
+            return True, str(sh)
+        else:
+            sh = tmp_dir / f"launch-{ts}.sh"
+            sh.write_text(
+                f'#!/bin/bash\necho "=== Claude Usage Analyzer - Deep Dive ==="\n'
+                f'cat "{ctx_file}" | claude\nrm -f "{ctx_file}"\n',
+                encoding="utf-8"
+            )
+            sh.chmod(0o755)
+            import shutil
+            for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"]:
+                if shutil.which(term):
+                    subprocess.Popen([term, "-e", str(sh)])
+                    return True, str(sh)
+            return False, f"No terminal detected. Run manually:\n  bash {sh}"
+    except Exception as e:
+        return False, str(e)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1256,6 +1638,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif self.path == "/api/analyzer/preflight":
+            avail, ver = _run_preflight()
+            body = json.dumps({"cli_available": avail, "version": ver}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/api/analyzer/snapshot":
+            snap = _get_analyzer_snapshot()
+            if snap is None:
+                body = json.dumps({"error": "No database found"}).encode("utf-8")
+                self.send_response(404)
+            else:
+                from analyzer import scrub, estimate_waste
+                body = json.dumps({"snapshot": scrub(snap), "waste": estimate_waste(snap)}).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/api/analyzer/stream":
+            if not _analyzer_lock.acquire(blocking=False):
+                self.send_response(409)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b'data: {"type":"error","message":"Analysis already running"}\n\n')
+                return
+            try:
+                snap = _get_analyzer_snapshot()
+                if snap is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                _stream_analyzer(snap, self.wfile)
+            finally:
+                _analyzer_lock.release()
 
         else:
             self.send_response(404)
@@ -1282,6 +1709,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif self.path == "/api/analyzer/launch-deep-dive":
+            snap = _get_analyzer_snapshot()
+            if snap is None:
+                resp = json.dumps({"ok": False, "error": "No database found"}).encode("utf-8")
+                self.send_response(404)
+            else:
+                ok, detail = _launch_deep_dive(snap)
+                resp = json.dumps({"ok": ok, "detail": detail}).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -1290,7 +1732,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
-    server = HTTPServer((host, port), DashboardHandler)
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
+
+    threading.Thread(target=_run_preflight, daemon=True, name="analyzer-preflight").start()
+
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     try:
