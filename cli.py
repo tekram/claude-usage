@@ -401,7 +401,7 @@ def cmd_analyze():
     try:
         proc = subprocess.Popen(
             ["claude", "--print", "--output-format", "stream-json",
-             "--include-partial-messages"],
+             "--verbose", "--include-partial-messages"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,
         )
@@ -443,17 +443,17 @@ def cmd_analyze():
 
 
 def _extract_text_delta(event):
-    """Extract text content from a claude --output-format stream-json event."""
-    t = event.get("type", "")
-    if "content_block_delta" in t or t == "content_block_delta":
-        delta = event.get("delta", {})
-        return delta.get("text") or ""
-    inner = event.get("event") or {}
-    if isinstance(inner, dict) and "content_block_delta" in inner.get("type", ""):
-        return (inner.get("delta") or {}).get("text", "")
-    se = event.get("stream_event") or {}
-    if isinstance(se, dict) and "content_block_delta" in se.get("type", ""):
-        return (se.get("delta") or {}).get("text", "")
+    """Extract text from a claude --output-format stream-json event."""
+    if event.get("type") == "stream_event":
+        inner = event.get("event") or {}
+        if inner.get("type") == "content_block_delta":
+            delta = inner.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        return None
+    if event.get("type") == "content_block_delta":
+        delta = event.get("delta") or {}
+        return delta.get("text", "")
     return None
 
 
