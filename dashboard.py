@@ -1127,17 +1127,23 @@ def _get_analyzer_snapshot():
 
 
 def _extract_text_delta(event):
-    """Extract text from a claude stream-json event."""
-    t = event.get("type", "")
-    if "content_block_delta" in t:
-        delta = event.get("delta", {})
-        return delta.get("text") or ""
-    inner = event.get("event") or {}
-    if isinstance(inner, dict) and "content_block_delta" in inner.get("type", ""):
-        return (inner.get("delta") or {}).get("text", "")
-    se = event.get("stream_event") or {}
-    if isinstance(se, dict) and "content_block_delta" in se.get("type", ""):
-        return (se.get("delta") or {}).get("text", "")
+    """Extract text from a claude stream-json event.
+
+    Actual format: {"type":"stream_event","event":{"type":"content_block_delta",
+    "delta":{"type":"text_delta","text":"..."}}}
+    """
+    # Primary: stream_event wrapper (confirmed format from claude v2.1.118)
+    if event.get("type") == "stream_event":
+        inner = event.get("event") or {}
+        if inner.get("type") == "content_block_delta":
+            delta = inner.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        return None
+    # Fallback: bare content_block_delta
+    if event.get("type") == "content_block_delta":
+        delta = event.get("delta") or {}
+        return delta.get("text", "")
     return None
 
 
@@ -1159,7 +1165,7 @@ def _stream_analyzer(snapshot, wfile):
     try:
         proc = subprocess.Popen(
             ["claude", "--print", "--output-format", "stream-json",
-             "--include-partial-messages"],
+             "--verbose", "--include-partial-messages"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,
         )
@@ -1179,8 +1185,8 @@ def _stream_analyzer(snapshot, wfile):
             if text:
                 suggestions += text
                 sse({"type": "chunk", "text": text})
-            t = ev.get("type", "")
-            if "result" in t and ev.get("duration_ms"):
+            # result event: {"type":"result","subtype":"success","usage":{...},"duration_ms":N}
+            if ev.get("type") == "result" and ev.get("subtype") == "success":
                 usage = ev.get("usage") or {}
                 sse({"type": "done",
                      "input_tokens":  usage.get("input_tokens", 0),
@@ -1205,8 +1211,6 @@ def _stream_analyzer(snapshot, wfile):
                 conn.close()
             except Exception:
                 pass
-
-        sse({"type": "done", "input_tokens": 0, "output_tokens": 0, "duration_ms": 0})
 
     except FileNotFoundError:
         sse({"type": "error", "message": "claude CLI not found"})
